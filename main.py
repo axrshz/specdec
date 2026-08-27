@@ -1,8 +1,8 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-target_name = "Qwen/Qwen3-32B"
-draft_name = "Qwen/Qwen3-4B"
+target_name = "google/gemma-4-31B-it"
+draft_name = "google/gemma-4-E2B-it"
 
 dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
