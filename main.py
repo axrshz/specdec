@@ -1,8 +1,8 @@
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-target_name = "Qwen/Qwen3-4B"
-draft_name = "Qwen/Qwen3-0.6B"
+target_name = "Qwen/Qwen3-32B"
+draft_name = "Qwen/Qwen3-4B"
 
 dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
@@ -26,6 +26,7 @@ def speculative_decode(
     max_new_tokens=100,
     draft_tokens=5,
     temperature=1.0,
+    return_stats: bool = False,
 ):
 
     assert input_ids.shape[0] == 1, "speculative_decode supports batch size 1 only"
@@ -70,6 +71,12 @@ def speculative_decode(
 
     sequence = input_ids.clone()
     generated_tokens = 0
+
+    # --- Stats tracking for benchmark: average accepted tokens per round ---
+    rounds = 0
+    accepted_per_round: list[int] = []
+    committed_per_round: list[int] = []
+    proposed_per_round: list[int] = []
 
     while generated_tokens < max_new_tokens:
         remaining = max_new_tokens - generated_tokens
@@ -142,6 +149,7 @@ def speculative_decode(
             to_commit.append(_sample(_probs(verification_logits[:, n_draft - 1, :])))
 
         finished = False
+        committed_before = generated_tokens
         for chunk in to_commit:
             if generated_tokens >= max_new_tokens:
                 finished = True
@@ -149,6 +157,12 @@ def speculative_decode(
             if _append(chunk):  # handles EOS truncation
                 finished = True
                 break
+        committed_this_round = generated_tokens - committed_before
+        # track per-round stats (lightweight)
+        rounds += 1
+        accepted_per_round.append(n_accepted)
+        committed_per_round.append(committed_this_round)
+        proposed_per_round.append(n_draft)
         if finished or generated_tokens >= max_new_tokens:
             break
 
@@ -171,7 +185,33 @@ def speculative_decode(
                 else:
                     draft_logits = logits
 
-    return sequence[:, input_ids.shape[1] :]
+    output = sequence[:, input_ids.shape[1] :]
+
+    if return_stats:
+        avg_accepted = sum(accepted_per_round) / len(accepted_per_round) if accepted_per_round else 0.0
+        avg_committed = sum(committed_per_round) / len(committed_per_round) if committed_per_round else 0.0
+        total_accepted = sum(accepted_per_round)
+        total_proposed = sum(proposed_per_round)
+        total_committed = sum(committed_per_round)
+        # accurate acceptance rate accounts for final partial round (n_draft < draft_tokens)
+        acceptance_rate = total_accepted / total_proposed if total_proposed else 0.0
+        stats = {
+            "rounds": rounds,
+            "accepted_per_round": accepted_per_round,
+            "committed_per_round": committed_per_round,
+            "proposed_per_round": proposed_per_round,
+            "avg_accepted": avg_accepted,
+            "avg_committed": avg_committed,
+            "total_accepted": total_accepted,
+            "total_proposed": total_proposed,
+            "total_committed": total_committed,
+            "total_generated": generated_tokens,
+            "draft_tokens": draft_tokens,
+            "acceptance_rate": acceptance_rate,
+        }
+        return output, stats
+
+    return output
 
 
 def main():

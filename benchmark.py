@@ -112,25 +112,56 @@ def benchmark(
         b_avg = sum(b_times) / len(b_times)
         b_tps = max_new_tokens / b_avg if b_avg > 0 else 0
 
-        # speculative
+        # speculative (timed + stats: avg accepted tokens per round)
         s_times = []
+        s_stats_runs = []
         for _ in range(num_runs):
-            _, dt = timed_run(speculative_decode, target_model, draft_model, input_ids, max_new_tokens, draft_tokens, temperature)
-            s_times.append(dt)
+            _sync()
+            t0 = time.perf_counter()
+            _, stats = speculative_decode(
+                target_model, draft_model, input_ids, max_new_tokens, draft_tokens, temperature, return_stats=True
+            )
+            _sync()
+            t1 = time.perf_counter()
+            s_times.append(t1 - t0)
+            s_stats_runs.append(stats)
         s_avg = sum(s_times) / len(s_times)
         s_tps = max_new_tokens / s_avg if s_avg > 0 else 0
 
         speedup = b_avg / s_avg if s_avg > 0 else float("inf")
 
-        # one correctness sample (decode)
+        # aggregate acceptance stats over num_runs (accuracy accounts for partial final round)
+        avg_accepted = sum(s["avg_accepted"] for s in s_stats_runs) / len(s_stats_runs) if s_stats_runs else 0.0
+        avg_committed = sum(s["avg_committed"] for s in s_stats_runs) / len(s_stats_runs) if s_stats_runs else 0.0
+        avg_rounds = sum(s["rounds"] for s in s_stats_runs) / len(s_stats_runs) if s_stats_runs else 0.0
+        total_accepted = sum(s["total_accepted"] for s in s_stats_runs)
+        total_proposed = sum(s["total_proposed"] for s in s_stats_runs)
+        acceptance_rate = total_accepted / total_proposed if total_proposed else 0.0
+
+        # one correctness sample (decode) - reuse last stats for preview if sampling temp >0
         b_out = baseline_generate(target_model, input_ids, max_new_tokens, temperature)
-        s_out = speculative_decode(target_model, draft_model, input_ids, max_new_tokens, draft_tokens, temperature)
+        s_out, s_sample_stats = speculative_decode(
+            target_model, draft_model, input_ids, max_new_tokens, draft_tokens, temperature, return_stats=True
+        )
         print(f"baseline : {b_avg:.3f}s avg over {num_runs} runs | {b_tps:.1f} tok/s | {b_out.shape[1]} tokens")
         print(f"speculative: {s_avg:.3f}s avg over {num_runs} runs | {s_tps:.1f} tok/s | {s_out.shape[1]} tokens")
         print(f"speedup: {speedup:.2f}x")
+        print(
+            f"acceptance: {avg_accepted:.2f} avg accepted draft tok/round | "
+            f"{avg_committed:.2f} avg committed tok/round (incl. bonus/replacement) | "
+            f"{acceptance_rate:.1%} acceptance rate | {avg_rounds:.1f} rounds avg over {num_runs} runs"
+        )
         # show raw times for variance
         print(f"  baseline times: {[f'{x:.3f}' for x in b_times]}")
         print(f"  spec times    : {[f'{x:.3f}' for x in s_times]}")
+        # per-run breakdown
+        per_run_accepted = [f"{s['avg_accepted']:.2f}" for s in s_stats_runs]
+        per_run_committed = [f"{s['avg_committed']:.2f}" for s in s_stats_runs]
+        per_run_rounds = [s['rounds'] for s in s_stats_runs]
+        print(f"  per-run accepted: {per_run_accepted}")
+        print(f"  per-run committed: {per_run_committed}")
+        print(f"  per-run rounds   : {per_run_rounds}")
+        print(f"  sample rounds detail: accepted_per_round={s_sample_stats['accepted_per_round'][:20]} committed_per_round={s_sample_stats['committed_per_round'][:20]}")
         # truncated decode preview
         print(f"  baseline preview: {tokenizer.decode(b_out[0][:40], skip_special_tokens=True)[:120]!r}")
         print(f"  spec preview    : {tokenizer.decode(s_out[0][:40], skip_special_tokens=True)[:120]!r}")
@@ -139,11 +170,14 @@ def benchmark(
             print(f"  peak mem: {torch.cuda.max_memory_allocated()/1e9:.2f} GB | reserved: {torch.cuda.max_memory_reserved()/1e9:.2f} GB")
             torch.cuda.reset_peak_memory_stats()
 
-        results.append((prompt, b_avg, s_avg, speedup))
+        results.append((prompt, b_avg, s_avg, speedup, avg_accepted, acceptance_rate))
 
     print("\n=== summary ===")
-    for prompt, b_avg, s_avg, speedup in results:
-        print(f"{speedup:.2f}x | baseline {b_avg:.3f}s | spec {s_avg:.3f}s | {prompt[:60]!r}")
+    for prompt, b_avg, s_avg, speedup, avg_accepted, acceptance_rate in results:
+        print(
+            f"{speedup:.2f}x | baseline {b_avg:.3f}s | spec {s_avg:.3f}s | "
+            f"{avg_accepted:.2f} tok/round ({acceptance_rate:.0%}) | {prompt[:60]!r}"
+        )
 
     return results
 
