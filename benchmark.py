@@ -10,11 +10,18 @@ from main import draft_name, load_model, speculative_decode, target_name
 
 @torch.inference_mode()
 def baseline_generate(model, input_ids, max_new_tokens=100, temperature=1.0):
-    """Vanilla greedy/sampling autoregressive decode with KV-cache. Batch 1 only."""
+    """Vanilla greedy/sampling autoregressive decode with KV-cache. Batch 1 only.
+
+    Uses the same explicit mask/position plumbing as `generate` so hybrid
+    sliding-window Gemma4 masks stay correct. No `crop()` here, so no
+    `activate_past_recording()` (sliding layers truncate naturally).
+    """
     assert input_ids.shape[0] == 1
-    eos_ids = torch.tensor(
-        model.generation_config.eos_token_id, dtype=torch.long, device=input_ids.device
-    )
+    device = model.device
+    eid = model.generation_config.eos_token_id
+    if isinstance(eid, int):
+        eid = [eid]
+    eos_ids = torch.tensor(eid, dtype=torch.long, device=device) if eid is not None else None
 
     def _probs(logits):
         if temperature == 0.0:
@@ -29,16 +36,27 @@ def baseline_generate(model, input_ids, max_new_tokens=100, temperature=1.0):
             return p.argmax(dim=-1, keepdim=True)
         return torch.multinomial(p, num_samples=1)
 
-    out = model(input_ids=input_ids, use_cache=True)
+    seq = input_ids.to(device).clone()
+    prompt_len = seq.shape[1]
+    shared = None
+    out = model(
+        input_ids=seq,
+        attention_mask=torch.ones(1, prompt_len, dtype=torch.long, device=device),
+        position_ids=torch.arange(prompt_len, device=device).unsqueeze(0),
+        use_cache=True,
+        logits_to_keep=1,
+        return_shared_kv_states=True,
+    )
     cache = out.past_key_values
+    shared = getattr(out, "shared_kv_states", None)
     logits = out.logits[:, -1, :]
-    sequence = input_ids.clone()
+    sequence = seq
     generated = 0
 
     while generated < max_new_tokens:
         nxt = _sample(logits)
         # EOS check
-        if torch.isin(nxt[0], eos_ids).any():
+        if eos_ids is not None and torch.isin(nxt[0], eos_ids).any():
             sequence = torch.cat([sequence, nxt], dim=1)
             generated += 1
             break
@@ -46,11 +64,24 @@ def baseline_generate(model, input_ids, max_new_tokens=100, temperature=1.0):
         generated += 1
         if generated >= max_new_tokens:
             break
-        out = model(input_ids=nxt, past_key_values=cache)
+        cur_len = sequence.shape[1] - 1  # position of `nxt`
+        kwargs = {
+            "input_ids": nxt,
+            "attention_mask": torch.ones(1, cur_len + 1, dtype=torch.long, device=device),
+            "position_ids": torch.tensor([[cur_len]], dtype=torch.long, device=device),
+            "past_key_values": cache,
+            "use_cache": True,
+            "logits_to_keep": 1,
+            "return_shared_kv_states": True,
+        }
+        if shared is not None:
+            kwargs["shared_kv_states"] = shared
+        out = model(**kwargs)
         logits = out.logits[:, -1, :]
         cache = out.past_key_values
+        shared = getattr(out, "shared_kv_states", shared)
 
-    return sequence[:, input_ids.shape[1] :]
+    return sequence[:, prompt_len:]
 
 
 def _sync():
@@ -93,7 +124,15 @@ def benchmark(
     results = []
 
     for prompt in prompts:
-        input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+        try:
+            input_ids = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                return_tensors="pt",
+                add_generation_prompt=True,
+            )
+        except Exception:
+            input_ids = tokenizer(prompt, return_tensors="pt").input_ids
+        input_ids = input_ids.to(device)
         prompt_len = input_ids.shape[1]
         print(f"\n=== prompt ({prompt_len} tokens): {prompt[:80]!r} ===")
         print(f"max_new_tokens={max_new_tokens} draft_tokens={draft_tokens} T={temperature}")
@@ -104,29 +143,57 @@ def benchmark(
             speculative_decode(target_model, draft_model, input_ids, max_new_tokens, draft_tokens, temperature)
             _sync()
 
-        # baseline
+        # baseline (track ACTUAL generated lengths: EOS can stop early)
         b_times = []
+        b_lens = []
+        b_outs = []
         for _ in range(num_runs):
-            _, dt = timed_run(baseline_generate, target_model, input_ids, max_new_tokens, temperature)
+            b_out_run, dt = timed_run(baseline_generate, target_model, input_ids, max_new_tokens, temperature)
             b_times.append(dt)
+            b_lens.append(b_out_run.shape[1])
+            b_outs.append(b_out_run)
         b_avg = sum(b_times) / len(b_times)
-        b_tps = max_new_tokens / b_avg if b_avg > 0 else 0
+        b_avg_len = sum(b_lens) / len(b_lens) if b_lens else 0
+        b_tps = b_avg_len / b_avg if b_avg > 0 else 0
 
         # speculative (timed + stats: avg accepted tokens per round)
         s_times = []
         s_stats_runs = []
+        s_lens = []
+        s_outs = []
         for _ in range(num_runs):
             _sync()
             t0 = time.perf_counter()
-            _, stats = speculative_decode(
+            s_out_run, stats = speculative_decode(
                 target_model, draft_model, input_ids, max_new_tokens, draft_tokens, temperature, return_stats=True
             )
             _sync()
             t1 = time.perf_counter()
             s_times.append(t1 - t0)
             s_stats_runs.append(stats)
+            s_lens.append(s_out_run.shape[1])
+            s_outs.append(s_out_run)
         s_avg = sum(s_times) / len(s_times)
-        s_tps = max_new_tokens / s_avg if s_avg > 0 else 0
+        s_avg_len = sum(s_lens) / len(s_lens) if s_lens else 0
+        s_tps = s_avg_len / s_avg if s_avg > 0 else 0
+
+        # lossless check: greedy (T==0) spec output must equal baseline exactly
+        if temperature == 0.0:
+            match = all(
+                b.shape[1] == b_outs[0].shape[1] and torch.equal(b.cpu(), b_outs[0].cpu())
+                for b in b_outs
+            ) and all(
+                s.shape[1] == b_outs[0].shape[1] and torch.equal(s.cpu(), b_outs[0].cpu())
+                for s in s_outs
+            )
+            print(f"lossless check (T=0 greedy): {'PASS' if match else 'FAIL'}")
+            if not match:
+                for i, (b, s) in enumerate(zip(b_outs, s_outs)):
+                    bb, ss = b[0].cpu().tolist(), s[0].cpu().tolist()
+                    diff = next((j for j, (x, y) in enumerate(zip(bb, ss)) if x != y), None)
+                    if b.shape[1] != s.shape[1] or diff is not None:
+                        print(f"  run {i}: baseline {b.shape[1]} tok vs spec {s.shape[1]} tok, first diff at pos {diff}")
+                        break
 
         speedup = b_avg / s_avg if s_avg > 0 else float("inf")
 
@@ -143,8 +210,8 @@ def benchmark(
         s_out, s_sample_stats = speculative_decode(
             target_model, draft_model, input_ids, max_new_tokens, draft_tokens, temperature, return_stats=True
         )
-        print(f"baseline : {b_avg:.3f}s avg over {num_runs} runs | {b_tps:.1f} tok/s | {b_out.shape[1]} tokens")
-        print(f"speculative: {s_avg:.3f}s avg over {num_runs} runs | {s_tps:.1f} tok/s | {s_out.shape[1]} tokens")
+        print(f"baseline : {b_avg:.3f}s avg over {num_runs} runs | {b_tps:.1f} tok/s | {b_avg_len:.1f} tokens avg")
+        print(f"speculative: {s_avg:.3f}s avg over {num_runs} runs | {s_tps:.1f} tok/s | {s_avg_len:.1f} tokens avg")
         print(f"speedup: {speedup:.2f}x")
         print(
             f"acceptance: {avg_accepted:.2f} avg accepted draft tok/round | "

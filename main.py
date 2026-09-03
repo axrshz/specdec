@@ -18,6 +18,52 @@ def load_model(name):
     return model
 
 
+def _eos_ids_for(model, device):
+    """Return EOS ids as a 1-D long tensor (handles int | list | None)."""
+    eid = model.generation_config.eos_token_id
+    if eid is None:
+        return None
+    if isinstance(eid, int):
+        eid = [eid]
+    return torch.tensor(eid, dtype=torch.long, device=device)
+
+
+def _trim_shared_kv(shared, keep_len):
+    """Trim shared_kv_states (Gemma4 KV-sharing / MTP) back to `keep_len` on dim 2."""
+    if shared is None:
+        return None
+    trimmed = {}
+    for k, v in shared.items():
+        kk, vv = v
+        if kk.shape[-2] > keep_len:
+            kk = kk[:, :, :keep_len, :]
+            vv = vv[:, :, :keep_len, :]
+        trimmed[k] = (kk, vv)
+    return trimmed
+
+
+def _forward(model, input_ids, attention_mask, position_ids, cache, shared, logits_to_keep):
+    """Single forward with the explicit args HF `generate` uses for Gemma4.
+
+    Always passes `use_cache=True`, explicit 2-D `attention_mask` + `position_ids`,
+    and threads `shared_kv_states` when the model supports it (harmless otherwise).
+    """
+    kwargs = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+        "past_key_values": cache,
+        "use_cache": True,
+        "logits_to_keep": logits_to_keep,
+    }
+    if shared is not None:
+        kwargs["shared_kv_states"] = shared
+    # Request shared states back; models without support simply ignore / return None.
+    kwargs["return_shared_kv_states"] = True
+    out = model(**kwargs)
+    return out
+
+
 @torch.inference_mode()
 def speculative_decode(
     target_model,
@@ -30,11 +76,9 @@ def speculative_decode(
 ):
 
     assert input_ids.shape[0] == 1, "speculative_decode supports batch size 1 only"
-    eos_ids = torch.tensor(
-        target_model.generation_config.eos_token_id,
-        dtype=torch.long,
-        device=input_ids.device,
-    )
+    t_dev = target_model.device
+    d_dev = draft_model.device
+    eos_ids = _eos_ids_for(target_model, t_dev)
 
     def _probs(logits):
         if temperature == 0.0:
@@ -50,26 +94,59 @@ def speculative_decode(
 
     def _append(tokens):
         nonlocal sequence, generated_tokens
-        mask = torch.isin(tokens[0], eos_ids)
-        if mask.any():
-            keep = int(mask.nonzero()[0].item()) + 1
-            sequence = torch.cat([sequence, tokens[:, :keep]], dim=1)
-            generated_tokens += keep
-            return True
+        # `tokens` lives on the target device; `eos_ids` too (None if model has none).
+        if eos_ids is not None:
+            mask = torch.isin(tokens[0], eos_ids)
+            if mask.any():
+                keep = int(mask.nonzero()[0].item()) + 1
+                sequence = torch.cat([sequence, tokens[:, :keep]], dim=1)
+                generated_tokens += keep
+                return True
         sequence = torch.cat([sequence, tokens], dim=1)
         generated_tokens += tokens.shape[1]
         return False
 
-    # --- Prefill: both caches cover the prompt ---
-    target_out = target_model(input_ids=input_ids, use_cache=True)
+    def _ones(n, device):
+        return torch.ones(1, n, dtype=torch.long, device=device)
+
+    def _positions(start, length, device):
+        return (torch.arange(length, device=device) + start).unsqueeze(0)
+
+    # --- Prefill: both caches cover the prompt (explicit mask/positions) ---
+    # Canonical sequence lives on the target device; slices are moved per model.
+    prompt_len = input_ids.shape[1]
+    sequence = input_ids.to(t_dev).clone()
+    target_out = _forward(
+        target_model,
+        sequence,
+        _ones(prompt_len, t_dev),
+        _positions(0, prompt_len, t_dev),
+        None,
+        None,
+        1,
+    )
     target_cache = target_out.past_key_values
+    target_shared = getattr(target_out, "shared_kv_states", None)
     target_logits = target_out.logits[:, -1, :]
 
-    draft_out = draft_model(input_ids=input_ids, use_cache=True)
+    draft_out = _forward(
+        draft_model,
+        sequence.to(d_dev),
+        _ones(prompt_len, d_dev),
+        _positions(0, prompt_len, d_dev),
+        None,
+        None,
+        1,
+    )
     draft_cache = draft_out.past_key_values
+    draft_shared = getattr(draft_out, "shared_kv_states", None)
     draft_logits = draft_out.logits[:, -1, :]
 
-    sequence = input_ids.clone()
+    # Gemma4 uses hybrid sliding-window layers: without this, `crop()` raises
+    # once the window (512) is reached, and rollback loses prefix tokens.
+    target_cache.activate_past_recording()
+    draft_cache.activate_past_recording()
+
     generated_tokens = 0
 
     # --- Stats tracking for benchmark: average accepted tokens per round ---
@@ -84,30 +161,54 @@ def speculative_decode(
         if n_draft == 0:
             break
 
+        # Round-start length == logical cache length (tracked explicitly so we
+        # never rely on `cache.get_seq_length()`, which is ambiguous for hybrid
+        # sliding/full caches).
+        L = sequence.shape[1]
+
         # --- 1. Draft phase: propose tokens with the draft model ---
-        proposals = []
-        draft_dists = []
+        proposals_d = []
+        draft_dists_d = []
         cur_logits = draft_logits
 
         for j in range(n_draft):
             probs = _probs(cur_logits)
             next_token = _sample(probs)
-            proposals.append(next_token)
-            draft_dists.append(probs)
+            proposals_d.append(next_token)
+            draft_dists_d.append(probs)
             if j < n_draft - 1:
-                cur_logits = draft_model(
-                    input_ids=next_token,
-                    past_key_values=draft_cache,
-                ).logits[:, -1, :]
+                out = _forward(
+                    draft_model,
+                    next_token,
+                    _ones(L + j + 1, d_dev),
+                    _positions(L + j, 1, d_dev),
+                    draft_cache,
+                    draft_shared,
+                    1,
+                )
+                draft_cache = out.past_key_values
+                draft_shared = getattr(out, "shared_kv_states", draft_shared)
+                cur_logits = out.logits[:, -1, :]
 
-        proposed_tokens = torch.cat(proposals, dim=1)
+        proposed_d = torch.cat(proposals_d, dim=1)
+        proposed_tokens = proposed_d.to(t_dev)
+        # Move draft dists to the target device for the acceptance test.
+        draft_dists = [p.to(t_dev) for p in draft_dists_d]
 
         # --- 2. Verification phase: score all proposals in one target pass ---
         # logits[:, i] predicts the position right after proposed_tokens[:, i]
-        verification_logits = target_model(
-            input_ids=proposed_tokens,
-            past_key_values=target_cache,
-        ).logits
+        v_out = _forward(
+            target_model,
+            proposed_tokens,
+            _ones(L + n_draft, t_dev),
+            _positions(L, n_draft, t_dev),
+            target_cache,
+            target_shared,
+            n_draft,
+        )
+        target_cache = v_out.past_key_values
+        target_shared = getattr(v_out, "shared_kv_states", target_shared)
+        verification_logits = v_out.logits
 
         n_accepted = 0
         replacement_token = None
@@ -166,24 +267,63 @@ def speculative_decode(
         if finished or generated_tokens >= max_new_tokens:
             break
 
-        # --- 4. Cache realignment ---
+        # --- 4. Cache realignment (Gemma4-aware) ---
+        # Verification polluted the target cache with all n_draft tokens and the
+        # draft cache with the first n_draft-1. Roll back the rejected suffix.
+        # `crop(0)` is NOT a no-op for sliding layers: it shrinks them back to
+        # the window, so call it even on full acceptance.
         if replacement_token is not None:
-            if n_draft - n_accepted > 0:
-                target_cache.crop(-(n_draft - n_accepted))
-            if n_draft - 1 - n_accepted > 0:
-                draft_cache.crop(-(n_draft - 1 - n_accepted))
+            target_cache.crop(-(n_draft - n_accepted))
+            draft_cache.crop(-(n_draft - 1 - n_accepted))
+            # Keep any threaded shared-KV in sync (needed for MTP-style
+            # assistants; harmless no-op otherwise as it is rebuilt from cache).
+            keep = L + n_accepted
+            target_shared = _trim_shared_kv(target_shared, keep)
+            draft_shared = _trim_shared_kv(draft_shared, keep)
+        else:
+            target_cache.crop(0)
+            draft_cache.crop(0)
 
-        # feed each cache only the suffix it is still missing
-        for cache, model in ((target_cache, target_model), (draft_cache, draft_model)):
-            missing = sequence[:, cache.get_seq_length() :]
-            if missing.shape[1]:
-                logits = model(input_ids=missing, past_key_values=cache).logits[
-                    :, -1, :
-                ]
-                if cache is target_cache:
-                    target_logits = logits
-                else:
-                    draft_logits = logits
+        # Logical cache lengths after the crop (derived from our own counters,
+        # not from per-layer `get_seq_length()`).
+        t_cache_len = L + n_accepted
+        if replacement_token is not None:
+            d_cache_len = L + n_accepted
+        else:
+            d_cache_len = L + n_accepted - 1  # last proposal was never fed
+        seq_len = sequence.shape[1]
+
+        # Feed each cache only the suffix it is still missing (replacement or
+        # bonus for target; replacement or last-proposal+bonus for draft).
+        t_missing = sequence[:, t_cache_len:seq_len]
+        if t_missing.shape[1]:
+            out = _forward(
+                target_model,
+                t_missing,
+                _ones(seq_len, t_dev),
+                _positions(t_cache_len, seq_len - t_cache_len, t_dev),
+                target_cache,
+                target_shared,
+                1,
+            )
+            target_cache = out.past_key_values
+            target_shared = getattr(out, "shared_kv_states", target_shared)
+            target_logits = out.logits[:, -1, :]
+
+        d_missing = sequence.to(d_dev)[:, d_cache_len:seq_len]
+        if d_missing.shape[1]:
+            out = _forward(
+                draft_model,
+                d_missing,
+                _ones(seq_len, d_dev),
+                _positions(d_cache_len, seq_len - d_cache_len, d_dev),
+                draft_cache,
+                draft_shared,
+                1,
+            )
+            draft_cache = out.past_key_values
+            draft_shared = getattr(out, "shared_kv_states", draft_shared)
+            draft_logits = out.logits[:, -1, :]
 
     output = sequence[:, input_ids.shape[1] :]
 
@@ -221,7 +361,16 @@ def main():
     target_model = load_model(target_name)
     draft_model = load_model(draft_name)
 
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(target_model.device)
+    # Gemma-4 IT models expect a chat template; fall back to raw prompt otherwise.
+    try:
+        input_ids = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            return_tensors="pt",
+            add_generation_prompt=True,
+        )
+    except Exception:
+        input_ids = tokenizer(prompt, return_tensors="pt").input_ids
+    input_ids = input_ids.to(target_model.device)
 
     output_ids = speculative_decode(
         target_model=target_model,
